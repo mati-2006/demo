@@ -1,0 +1,12 @@
+torch
+torchvision
+ultralytics
+huggingface_hub
+Pillow
+numpy
+opencv-python-headless
+gradio
+fastapi
+uvicorn
+requests
+pydantic
