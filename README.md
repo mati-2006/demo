@@ -27,7 +27,7 @@ Open the local URL Gradio prints (usually `http://127.0.0.1:7860`).
 ### Demo flow
 
 1. Tab **Detect** — upload a document, click **Detect signatures**
-2. Tab **Verify** — pick a detected crop, upload a specimen signature, click **Verify**
+2. Tab **Verify** — pick a detected crop, add a specimen via **Draw** (600×200 pad), **Upload**, or **Clipboard**, click **Verify**
 
 First run downloads models from Hugging Face (needs internet).
 >>>>>>> b8357fe (Initial commit)

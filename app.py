@@ -14,11 +14,19 @@ from signature_models import (
 )
 
 pipeline = SignaturePipeline()
-# Upload toolbar: file · webcam · clipboard (clipboard is a real button in the image footer)
+# Document toolbar: file · webcam · clipboard
 IMAGE_SOURCES = ["upload", "clipboard", "webcam"]
 IMAGE_PLACEHOLDER = (
     "# Add an image\n"
     "Drop a file, paste from clipboard, or use the webcam"
+)
+# Specimen sources (Verify tab): Draw pad · Upload · Clipboard
+SPECIMEN_MODES = ["Draw", "Upload", "Clipboard"]
+# Common eKYC-style signature pad canvas (width × height)
+SPECIMEN_PAD_SIZE = (600, 200)
+SPECIMEN_UPLOAD_PLACEHOLDER = (
+    "# Specimen image\n"
+    "Drop a file or paste from clipboard"
 )
 
 
@@ -76,16 +84,82 @@ def detect(
     )
 
 
+def _image_has_ink(image: Image.Image) -> bool:
+    """True if the image has non-empty ink (not a blank pad)."""
+    if image.mode in ("RGBA", "LA"):
+        alpha = image.getchannel("A")
+        if alpha.getextrema()[1] == 0:
+            return False
+        # Ink = non-transparent pixels that are not near-white
+        rgba = image.convert("RGBA")
+        pixels = list(rgba.getdata())
+        ink = sum(
+            1
+            for r, g, b, a in pixels
+            if a > 10 and (r < 245 or g < 245 or b < 245)
+        )
+        return ink >= 30
+    gray = image.convert("L")
+    # Count dark-ish pixels
+    hist = gray.histogram()
+    return sum(hist[:200]) >= 30
+
+
+def resolve_specimen(
+    mode: str | None,
+    draw_value,
+    file_value: Image.Image | None,
+) -> Image.Image | None:
+    """Pick the active specimen from Draw pad or Upload/Clipboard image."""
+    if mode == "Draw":
+        if draw_value is None:
+            return None
+        if isinstance(draw_value, dict):
+            image = draw_value.get("composite")
+        else:
+            image = draw_value
+        if image is None:
+            return None
+        if not isinstance(image, Image.Image):
+            image = Image.fromarray(image)
+        if not _image_has_ink(image):
+            return None
+        return image
+    return file_value
+
+
+def switch_specimen_mode(mode: str):
+    """Show Draw pad or Upload/Clipboard image; sync Image sources to the mode."""
+    if mode == "Draw":
+        return (
+            gr.update(visible=True),
+            gr.update(visible=False),
+        )
+    sources = ["upload"] if mode == "Upload" else ["clipboard"]
+    placeholder = (
+        "# Upload specimen\nDrop or browse a signature image"
+        if mode == "Upload"
+        else "# Paste specimen\nClick Paste, then Ctrl/Cmd+V"
+    )
+    return (
+        gr.update(visible=False),
+        gr.update(visible=True, sources=sources, placeholder=placeholder),
+    )
+
+
 def verify(
     detections: list | None,
     selected: str | None,
-    reference: Image.Image | None,
+    specimen_mode: str | None,
+    draw_value,
+    file_value: Image.Image | None,
     verify_threshold: float,
 ):
     if not detections:
         raise gr.Error("Run detection first so there is a document signature to compare.")
+    reference = resolve_specimen(specimen_mode, draw_value, file_value)
     if reference is None:
-        raise gr.Error("Upload or paste a specimen signature.")
+        raise gr.Error("Add a specimen via Draw, Upload, or Clipboard.")
     if not selected:
         raise gr.Error("Select which detected signature to verify.")
 
@@ -98,11 +172,17 @@ def verify(
         raise gr.Error("Selected signature is out of range. Re-run detection.")
 
     document_crop = detections[index]["crop"]
+    # Draw pad must use the pad cleanup path (not document line-inpaint).
+    ref_source = "pad" if specimen_mode == "Draw" else "auto"
     try:
-        result = pipeline.verify(document_crop, reference, threshold=verify_threshold)
+        result = pipeline.verify(
+            document_crop,
+            reference,
+            threshold=verify_threshold,
+            reference_source=ref_source,
+        )
     except ValueError as exc:
         raise gr.Error(str(exc)) from exc
-    # Show the same preprocessed 105×105 images used for embeddings
     return (
         result["processed_document"],
         result["processed_reference"],
@@ -119,15 +199,19 @@ def preview_selected(detections: list | None, selected: str | None):
         return None
     if index < 0 or index >= len(detections):
         return None
-    # Document-crop preprocess (line removal → 105×105)
     try:
         return pipeline.preprocess_document(detections[index]["crop"])
     except ValueError:
         return detections[index]["crop"]
 
 
-def preview_specimen(image: Image.Image | None):
-    """Live Specimen preview = signature-pad preprocess → 105×105."""
+def preview_specimen(
+    mode: str | None,
+    draw_value,
+    file_value: Image.Image | None,
+):
+    """Live specimen preview from the active Draw / Upload / Clipboard source."""
+    image = resolve_specimen(mode, draw_value, file_value)
     if image is None:
         return None
     try:
@@ -155,7 +239,7 @@ def _idle_result() -> str:
     return """
     <div class="result-idle">
       <strong>Ready to verify</strong>
-      <span>Select a detected signature, add a specimen (upload · clipboard · webcam), then verify.</span>
+      <span>Select a detected signature, add a specimen (draw · upload · clipboard), then verify.</span>
     </div>
     """
 
@@ -419,7 +503,7 @@ button.primary:hover {
 #specimen-input .source-selection button[aria-label="Paste from clipboard"]::after {
   content: "Paste";
 }
-/* Keep Upload / Webcam / Paste on one row in the Specimen column */
+/* Specimen upload / clipboard source bar */
 #specimen-input .source-selection {
   flex-wrap: nowrap !important;
   gap: 4px !important;
@@ -435,6 +519,22 @@ button.primary:hover {
 #specimen-input .source-selection button.icon svg {
   width: 12px !important;
   height: 12px !important;
+}
+
+/* Signature pad (Draw) */
+#specimen-pad {
+  min-height: 220px !important;
+}
+#specimen-pad .image-container,
+#specimen-pad [data-testid="image"] {
+  background: #ffffff !important;
+  border: 1px dashed var(--line) !important;
+  border-radius: 12px !important;
+}
+#specimen-mode label,
+#specimen-mode span {
+  font-family: "Manrope", sans-serif !important;
+  font-weight: 650 !important;
 }
 
 /* Sliders */
@@ -682,7 +782,7 @@ with gr.Blocks() as demo:
         <div id="hero">
           <div class="brand">InkCheck</div>
           <h1>Signature Detect &amp; Verify</h1>
-          <p>Locate signatures on a document, then compare a specimen with upload, clipboard paste, or webcam.</p>
+          <p>Locate signatures on a document, then compare a specimen via draw pad, upload, or clipboard.</p>
         </div>
         """
     )
@@ -769,21 +869,48 @@ with gr.Blocks() as demo:
                     value=DEFAULT_VERIFY_THRESHOLD,
                     step=0.01,
                     label="Match threshold",
-                    info="Match when similarity ≥ this value (izamscientist ConvNeXt-Tiny)",
+                    info="Match when similarity ≥ this value (from this slider).",
                     scale=2,
                 )
 
+            specimen_mode = gr.Radio(
+                SPECIMEN_MODES,
+                value="Draw",
+                label="Specimen source",
+                info="Draw on the pad, upload a file, or paste from clipboard",
+                elem_id="specimen-mode",
+            )
+
             with gr.Row(equal_height=True, elem_id="verify-row"):
-                reference_input = gr.Image(
-                    label="Specimen",
-                    type="pil",
-                    height=300,
-                    sources=IMAGE_SOURCES,
-                    placeholder=IMAGE_PLACEHOLDER,
-                    elem_id="specimen-input",
-                    scale=2,
-                    min_width=300,
-                )
+                with gr.Column(scale=2, min_width=300):
+                    specimen_draw = gr.Sketchpad(
+                        label="Draw specimen",
+                        type="pil",
+                        image_mode="RGBA",
+                        sources=(),
+                        canvas_size=SPECIMEN_PAD_SIZE,
+                        fixed_canvas=True,
+                        layers=False,
+                        brush=gr.Brush(
+                            default_size=5,
+                            colors=["#111111"],
+                            color_mode="fixed",
+                            default_color="#111111",
+                        ),
+                        eraser=gr.Eraser(default_size=12),
+                        height=240,
+                        elem_id="specimen-pad",
+                        visible=True,
+                    )
+                    specimen_file = gr.Image(
+                        label="Specimen",
+                        type="pil",
+                        height=300,
+                        sources=["upload"],
+                        placeholder=SPECIMEN_UPLOAD_PLACEHOLDER,
+                        elem_id="specimen-input",
+                        visible=False,
+                    )
                 doc_sig_preview = gr.Image(
                     label="Document (cleaned → model)",
                     type="pil",
@@ -813,9 +940,23 @@ with gr.Blocks() as demo:
         inputs=[detections_state, signature_choice],
         outputs=[doc_sig_preview],
     )
-    reference_input.change(
+    specimen_mode.change(
+        fn=switch_specimen_mode,
+        inputs=[specimen_mode],
+        outputs=[specimen_draw, specimen_file],
+    ).then(
         fn=preview_specimen,
-        inputs=[reference_input],
+        inputs=[specimen_mode, specimen_draw, specimen_file],
+        outputs=[specimen_preview],
+    )
+    specimen_draw.change(
+        fn=preview_specimen,
+        inputs=[specimen_mode, specimen_draw, specimen_file],
+        outputs=[specimen_preview],
+    )
+    specimen_file.change(
+        fn=preview_specimen,
+        inputs=[specimen_mode, specimen_draw, specimen_file],
         outputs=[specimen_preview],
     )
 
@@ -836,9 +977,16 @@ with gr.Blocks() as demo:
 
     verify_btn.click(
         fn=verify,
-        inputs=[detections_state, signature_choice, reference_input, verify_threshold],
+        inputs=[
+            detections_state,
+            signature_choice,
+            specimen_mode,
+            specimen_draw,
+            specimen_file,
+            verify_threshold,
+        ],
         outputs=[doc_sig_preview, specimen_preview, verify_result],
     )
 
 if __name__ == "__main__":
-    demo.queue().launch(css=CUSTOM_CSS, theme=THEME)
+    demo.queue().launch(css=CUSTOM_CSS, theme=THEME, server_port=7860)
